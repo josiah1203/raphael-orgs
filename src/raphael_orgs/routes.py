@@ -3,53 +3,58 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException
+
+from raphael_orgs.hblabs.db import PlatformStore
+from raphael_orgs.hblabs.rbac.service import OrgRBACService, OrgRole
 
 router = APIRouter(tags=["orgs"])
 
 _db = Path(os.environ.get("RAPHAEL_ORGS_DB", "/tmp/raphael-orgs.db"))
-_conn = sqlite3.connect(_db, check_same_thread=False)
-_conn.row_factory = sqlite3.Row
-_conn.executescript(
+_store = PlatformStore(_db)
+_rbac = OrgRBACService(_store)
+_store.execute(
     """
-    CREATE TABLE IF NOT EXISTS orgs (id TEXT PRIMARY KEY, name TEXT NOT NULL, verified INTEGER DEFAULT 0);
-    CREATE TABLE IF NOT EXISTS memberships (org_id TEXT, user_id TEXT, role TEXT, PRIMARY KEY (org_id, user_id));
-    CREATE TABLE IF NOT EXISTS invites (id TEXT PRIMARY KEY, org_id TEXT, email TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS invites (
+        id TEXT PRIMARY KEY,
+        org_id TEXT NOT NULL,
+        email TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
     """
 )
-_conn.execute("INSERT OR IGNORE INTO orgs (id, name) VALUES ('org_default', 'Default Organization')")
-_conn.commit()
+_store.execute(
+    "INSERT OR IGNORE INTO orgs (id, name, plan, region, created_at) VALUES (?, ?, 'free', 'us-east-1', ?)",
+    ("org_default", "Default Organization", datetime.now(timezone.utc).timestamp()),
+)
 
 
 @router.get("")
 def list_orgs() -> dict[str, list]:
-    rows = _conn.execute("SELECT id, name, verified FROM orgs").fetchall()
-    return {"orgs": [{"id": r["id"], "name": r["name"], "verified": bool(r["verified"])} for r in rows]}
+    rows = _store.fetchall("SELECT id, name, plan, region FROM orgs ORDER BY created_at DESC")
+    return {"orgs": [{"id": r["id"], "name": r["name"], "plan": r["plan"], "region": r["region"]} for r in rows]}
 
 
 @router.post("")
 def create_org(body: dict[str, Any]) -> dict[str, Any]:
     oid = body.get("id", f"org_{int(datetime.now(timezone.utc).timestamp())}")
-    _conn.execute("INSERT INTO orgs (id, name) VALUES (?, ?)", (oid, body["name"]))
-    _conn.commit()
-    return {"id": oid, "name": body["name"], "verified": False}
+    org = _rbac.create_org(oid, body["name"], plan=body.get("plan", "free"), region=body.get("region", "us-east-1"))
+    return {"id": org.id, "name": org.name, "plan": org.plan, "region": org.region}
 
 
 @router.post("/{org_id}/invites")
 def create_invite(org_id: str, body: dict[str, Any]) -> dict[str, str]:
     iid = f"inv_{int(datetime.now(timezone.utc).timestamp())}"
     email = body["email"]
-    _conn.execute(
+    _store.execute(
         "INSERT INTO invites (id, org_id, email, created_at) VALUES (?, ?, ?, ?)",
         (iid, org_id, email, datetime.now(timezone.utc).isoformat()),
     )
-    _conn.commit()
-    import httpx
 
     notif = os.environ.get("RAPHAEL_NOTIFICATIONS_URL", "http://127.0.0.1:8090")
     try:
@@ -65,5 +70,18 @@ def create_invite(org_id: str, body: dict[str, Any]) -> dict[str, str]:
 
 @router.get("/{org_id}/members")
 def list_members(org_id: str) -> dict[str, list]:
-    rows = _conn.execute("SELECT user_id, role FROM memberships WHERE org_id = ?", (org_id,)).fetchall()
+    rows = _rbac.list_members(org_id)
     return {"members": [{"user_id": r["user_id"], "role": r["role"]} for r in rows]}
+
+
+@router.post("/{org_id}/members")
+def add_member(org_id: str, body: dict[str, Any]) -> dict[str, str]:
+    membership_id = body.get("id", f"mbr_{int(datetime.now(timezone.utc).timestamp())}")
+    user_id = body["user_id"]
+    role_value = body.get("role", "member")
+    try:
+        role = OrgRole(role_value)
+    except ValueError as exc:
+        raise HTTPException(400, detail="invalid_role") from exc
+    member = _rbac.add_member(membership_id, org_id, user_id, role)
+    return {"id": member.id, "org_id": member.org_id, "user_id": member.user_id, "role": member.role.value}
