@@ -1,4 +1,4 @@
-"""SQLite store for local/dev; designed for PostgreSQL RLS in production."""
+"""SQLite store for local/dev; PostgreSQL when RAPHAEL_DATABASE_URL is set."""
 
 from __future__ import annotations
 
@@ -11,14 +11,23 @@ class PlatformStore:
     """Persistent store for hosted platform entities."""
 
     def __init__(self, db_path: Path | str) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+        from raphael_contracts import db as rdb
+
+        self._postgres = rdb.is_postgres()
+        if self._postgres:
+            rdb.ensure_migrations()
+            self.db_path = Path("postgres")
+        else:
+            self.db_path = Path(db_path)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_schema()
 
     @property
     def conn(self) -> sqlite3.Connection:
+        if self._postgres:
+            raise RuntimeError("conn property is SQLite-only")
         return self._conn
 
     def _init_schema(self) -> None:
@@ -89,20 +98,52 @@ class PlatformStore:
                 redirect_uri TEXT,
                 expires_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS invites (
+                id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS connection_keys (
+                id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL,
+                key_type TEXT NOT NULL DEFAULT 'join',
+                key_prefix TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                label TEXT,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                rotated_from TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_connection_keys_hash ON connection_keys (key_hash);
             """
         )
         self._conn.commit()
 
-    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        if self._postgres:
+            from raphael_contracts.db import pg_execute
+
+            return pg_execute(sql, params)
         cur = self._conn.execute(sql, params)
         self._conn.commit()
         return cur
 
-    def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
+    def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Any | None:
+        if self._postgres:
+            from raphael_contracts.db import pg_fetchone
+
+            return pg_fetchone(sql, params)
         return self._conn.execute(sql, params).fetchone()
 
-    def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+    def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        if self._postgres:
+            from raphael_contracts.db import pg_fetchall
+
+            return pg_fetchall(sql, params)
         return self._conn.execute(sql, params).fetchall()
 
     def close(self) -> None:
-        self._conn.close()
+        if not self._postgres:
+            self._conn.close()
