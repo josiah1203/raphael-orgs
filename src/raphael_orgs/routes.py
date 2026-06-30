@@ -198,8 +198,59 @@ def check_membership(org_id: str, user_id: str) -> dict[str, str]:
 
 
 @router.patch("/{org_id}/settings")
-def patch_org_settings(org_id: str, body: dict[str, Any]) -> dict[str, str]:
-    return {"status": "saved", "org_id": org_id}
+def patch_org_settings(org_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    _store.execute(
+        """
+        CREATE TABLE IF NOT EXISTS org_settings (
+            org_id TEXT PRIMARY KEY,
+            sso_url TEXT,
+            sso_entity TEXT,
+            enforce_sso INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    existing = _store.fetchone("SELECT org_id FROM org_settings WHERE org_id = ?", (org_id,))
+    sso_url = body.get("sso_url")
+    sso_entity = body.get("sso_entity")
+    enforce = 1 if body.get("enforce_sso") else 0
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        _store.execute(
+            "UPDATE org_settings SET sso_url = COALESCE(?, sso_url), sso_entity = COALESCE(?, sso_entity), "
+            "enforce_sso = COALESCE(?, enforce_sso), updated_at = ? WHERE org_id = ?",
+            (sso_url, sso_entity, enforce if "enforce_sso" in body else None, now, org_id),
+        )
+    else:
+        _store.execute(
+            "INSERT INTO org_settings (org_id, sso_url, sso_entity, enforce_sso, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (org_id, sso_url or "", sso_entity or "", enforce, now),
+        )
+    return get_org_settings(org_id)
+
+
+@router.get("/{org_id}/settings")
+def get_org_settings(org_id: str) -> dict[str, Any]:
+    _store.execute(
+        """
+        CREATE TABLE IF NOT EXISTS org_settings (
+            org_id TEXT PRIMARY KEY,
+            sso_url TEXT,
+            sso_entity TEXT,
+            enforce_sso INTEGER DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    row = _store.fetchone("SELECT sso_url, sso_entity, enforce_sso FROM org_settings WHERE org_id = ?", (org_id,))
+    if not row:
+        return {"org_id": org_id, "sso_url": "", "sso_entity": "", "enforce_sso": False}
+    return {
+        "org_id": org_id,
+        "sso_url": row["sso_url"] or "",
+        "sso_entity": row["sso_entity"] or "",
+        "enforce_sso": bool(row["enforce_sso"]),
+    }
 
 
 @router.get("/{org_id}/connection-keys")
